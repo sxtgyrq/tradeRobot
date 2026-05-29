@@ -1,50 +1,69 @@
+Ôªø#pragma once
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
 class Cal
 {
 public:
-	Cal(int* cudaPoints, int costTimeCount, int* lastFP, int fPCount, int calUnitCount, int* startDic, int* endDic);
-
-	//int[] costTime, int[] lastFP, int[] resultForSave, int costTimeCount, int FPCount, int[] startDic, int[] endDic
-	//int* Cal();
+	Cal(
+		const int* cudaPoints,
+		int cudaPointLength,
+		const int* connect,
+		int connectLength,
+		const int* lastFP,
+		int lastFPLength);
 	~Cal();
+
+	int StatusCode() const;
+	const char* StatusMessage() const;
+
+	int* DeviceCudaPoints() const;
+	int CudaPointLength() const;
+	int PointCount() const;
+
+	int* DeviceConnect() const;
+	int ConnectLength() const;
+
+	int* DeviceLastFP() const;
+	int LastFPLength() const;
+	int UnitCount() const;
+
+
+	int TotalLength() const;
+	int CopyLastFPToHost(int* target, int length) const;
+
+	void loopAndFindPath();
+
 private:
-	//int CostTimeCount;
+	int CopyToDevice(const int* source, int length, int** target, const char* name);
+	int AllocateDeviceBuffer(int length, int** target, const char* name);
+	int AllocateDeviceBuffer(int length, unsigned long long** target, const char* name);
+	void SetCudaError(cudaError_t status, const char* message);
+	void Release();
 
-	int PointCount;
+	int cudaPointLengthValue = 0;
+	int pointCountValue = 0;
+	int connectLengthValue = 0;
+	int lastFPLengthValue = 0;
+	int unitCountValue = 0;
+	int statusCodeValue = 0;
+	const char* statusMessageValue = nullptr;
 
-	int UnitCount;
+	int* cudaPointsGpu = nullptr;
+	int* connectGpu = nullptr;
+	int* lastFPGpu = nullptr;
+	int* lastFPOutGpu = nullptr;
+	int* passedLengthGPU = nullptr;
+	int* finishedStateGpu = nullptr;
+	int* unitFinishedGpu = nullptr;
+	int* hostUnitFinished = nullptr;
 
-	int PointCountPerUnit;
-	int SegCountPerUnit;
+	int BlockCount;//ÂàùÂßãÂåñ‚àö
 
-	int BlockCount;//≥ı ºªØ°Ã
 
-	int* CostTime;
-	int* CostTime_GPU = 0;
-
-	int* LastFP;
-	int* LastFP_GPU = 0;
-	int* LastFP_Out_GPU = 0;
-
-	int* StartDic;
-	int* StartDic_GPU = 0;
-
-	int* EndDic;
-	int* EndDic_GPU = 0;
-
-	int* MinStepResult_GPU;//≥ı ºªØ°Ã
-	//int* MinStepResult_CALMINVALUE_GPU;//≥ı ºªØ°Ã
-
-	int* MinStepResult_OnOff_GPU;//≥ı ºªØ°Ã
-	//int* MinStepResult;//≥ı ºªØ°Ã
-
-	cudaError_t CalculateMinStep();
-	cudaError_t FindMin();
-	cudaError_t Reduce();
-	cudaError_t	Copy();
+	cudaError_t CalculateMinStep(int* minStepResultGpu, int* minStepResultOnOffGpu);
+	cudaError_t FindMin(int* minStepResultGpu);
+	cudaError_t Reduce(int* minStepResultGpu, int* minStepResultOnOffGpu);
+	cudaError_t Copy();
 	bool NotFinished();
-public:
-	int* LastFPResult;
 };

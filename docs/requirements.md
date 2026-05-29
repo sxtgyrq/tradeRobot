@@ -19,7 +19,7 @@
 - 交易所坐标固定为 `(0, 0)`。
 - 坐标范围为 `|x| <= MaxX`、`|y| <= MaxY`。
 - 当前默认边界为 `MaxX = 1000000`、`MaxY = 1000000`。
-- 默认生成圆数量为 `N = 10000`，该值作为可调整常量。
+- 当前代码默认生成圆数量为 `N = 256`，该值对应 `CircleGenerator.DefaultCircleCount`，后期可继续作为常量调整；业务目标数量可逐步提高到 `10000`。
 
 ### 2.2 圆生成约束
 
@@ -60,7 +60,7 @@
 GenerateCircle()
 ```
 
-该方法会使用当前程序运行目录下的 `Circle.bin`，并以 `DefaultCircleCount = 10000` 作为目标数量。
+该方法会使用当前程序运行目录下的 `Circle.bin`，并以 `DefaultCircleCount = 256` 作为当前代码默认目标数量。
 
 内部可指定输出文件和目标数量：
 
@@ -83,7 +83,7 @@ GenerateCircle(outputPath, count)
 5. 随机生成的圆不能与已有圆形成相同几何圆 `(a, b, R)`。
 6. 随机生成的圆必须与已有圆集合中的至少一个圆存在圆周相交或相切关系。
 7. 只有满足上述条件的随机圆才能加入圆集合。
-8. 重复随机生成过程，直到圆数量达到 `count` 指定的数量；当前默认 `count = 10000`，后期可调整。
+8. 重复随机生成过程，直到圆数量达到 `count` 指定的数量；当前代码默认 `count = 256`，后期可调整并逐步提高到目标数量。
 
 由于两个基础圆已经连通，并且每一个后续新增圆都必须与已有圆集合中的至少一个圆相交或相切，因此最终生成的所有圆应属于同一个连通分量。
 
@@ -182,6 +182,50 @@ n = floor(2 * π * R) * M + 1
 圆被划分后得到的圆上点，统一定义为路径点。路径点按当前圆的分段方向从极点开始依次编号，编号范围为 `0` 到 `n - 1`，不额外生成与极点重复的终点。
 
 收割点与采购点统称为交易点。除交易点以外的其他路径点，统称为流通点。
+
+#### 2.6.1 K 线五行运行中的交易点账户初始化
+
+K 线五行运行开始时，数据初始化必须按交易点类型分配账户，而不是按普通圆记录直接分配账户。
+
+交易点只包括两类：
+
+- 收割点。
+- 采购点。
+
+每个交易点账户都必须包含：
+
+- 聪余额。
+- `U` 余额。
+- 合约单列表。
+- 现货单列表。
+
+每个交易点都必须带有 `OwnerCircleId` 和 `PointCircleId`。这两个字段都不能为 null 或空字符串，并且都必须是 `24` 位小写十六进制字符串，满足正则表达式 `^[0-9a-f]{24}$`。
+
+真实圆 ID 由 `Circle.bin` 中该圆的原始 `12` 字节数据直接转换得到：每个字节写成两位小写十六进制字符，因此真实圆 ID 固定为 `24` 个字符。
+
+采购点涉及两个圆序号时，需要同时保留：
+
+- 账户归属圆 ID，即该采购点被分配给哪个圆。
+- 路径点所在圆 ID，即该采购点实际落在哪个圆的路径点上。
+
+收割点账户没有真实归属圆，必须使用虚拟归属圆 `(0,0,0)`：
+
+```text
+OwnerCircleIndex = -1
+OwnerCircleId = 000000000000000000000000
+```
+
+这个虚拟 `OwnerCircleId` 同样满足 `^[0-9a-f]{24}$`，但它不表示一个合法真实圆，也不来自 `Circle.bin`。
+
+收割点实际落在哪个真实圆上，不看 `OwnerCircleId`，而应看 `PointCircleId` 和 `PointIndex`。
+
+初始资产按交易点类型区分：
+
+- 所有交易点账户初始都拥有 `1000U`。
+- 收割点账户初始额外拥有 `210000000000` 聪。
+- 采购点账户初始拥有 `0` 聪。
+
+系统初始化时必须先识别交易点是收割点还是采购点，再按上述规则写入初始资产；不得把收割点和采购点按同一套默认资产初始化。
 
 路径点 `n - 1` 定义为该圆的末尾联通点。末尾联通点用于表示该圆路径序列的末尾，并按照当前圆允许的路径方向单向连接回路径点 `0`。末尾联通点是路径点的一种特殊状态，但不属于圆间连通关系产生的普通联通点。
 
@@ -333,6 +377,8 @@ cudaPoints[i * 3 + 2] = pointType
 pointCount = cudaPoints.Length / 3
 ```
 
+构建或传入 CUDA 前，必须校验 `cudaPoints.Length` 是 `3` 的整数倍。若 `cudaPoints.Length % 3 != 0`，说明 CUDA 点集三元组不完整，系统应直接报错，不得继续调用 CUDA。
+
 例如合成后的点集为：
 
 ```text
@@ -381,13 +427,61 @@ cudaPoints[i * 3 + 2] = pointType
 
 因此，所有依赖点序号的辅助数组都必须使用同一套排序后的点序号，不能使用圆内 `pointIndex` 代替 CUDA 点序号。
 
+在构建 `cudaPoints` 和 `connect` 前，必须对排序后的合并点集做顺序与唯一性校验：
+
+- 合并点集必须严格按照 `circleIndex`、`pointIndex`、`pointType` 升序排列；如果发现后一项小于前一项，系统应直接报错，不得继续调用 CUDA。
+- 合并点集中不能存在重复的路径点位置，即不能出现两个或多个点拥有相同的 `(circleIndex, pointIndex)`；如果发现重复位置，说明点合并逻辑错误，系统应直接报错，不得继续调用 CUDA。
+
+在传入 CUDA 前，必须校验每个合并点自身的业务合法性：
+
+- `pointType` 必须大于 `0`，且只能由 `2`、`3`、`5`、`7`、`11` 这些角色编码质因子相乘得到；如果出现 `0`、负数或未知质因子，系统应直接报错，不得继续调用 CUDA。
+- 同一种角色编码质因子在同一个 `pointType` 中最多只能出现一次；例如 `4`、`9`、`25`、`49`、`121` 均为非法编码，系统应直接报错，不得继续调用 CUDA。
+- `pointType` 至少应包含一个有效角色；如果某个合并点没有收割点、第一路径点、末尾联通点、普通联通点或采购点中的任一角色，系统应直接报错，不得继续调用 CUDA。
+- 占用型角色包括收割点、末尾联通点、普通联通点、采购点；同一个合并点最多只能拥有一个占用型角色。
+- 第一路径点不是占用型角色，可以与一个占用型角色叠加，但不能让同一个合并点同时拥有两个或多个占用型角色。
+- `circleIndex` 必须落在 `[0, circleCount - 1]` 范围内。
+- `pointIndex` 必须落在当前圆的路径点范围内，即 `[0, pathPointCounts[circleIndex] - 1]`。
+- 如果 `pointType % 3 == 0`，则该点必须是当前圆的第一路径点，即 `pointIndex == 0`。
+- 如果 `pointType % 5 == 0`，则该点必须是当前圆的末尾联通点，即 `pointIndex == pathPointCounts[circleIndex] - 1`。
+- 收割点、普通联通点、采购点不能落在当前圆的末尾联通点位置，即它们的 `pointIndex` 不能等于 `pathPointCounts[circleIndex] - 1`。
+
 在传入 CUDA 前，必须校验以下数量关系：
 
 - 收割点数量必须等于 `1`。
 - 采购点数量必须等于圆数量。
 - 第一路径点数量必须等于圆数量。
 - 末尾联通点数量必须等于圆数量。
+- 普通联通点数量必须是偶数；普通联通关系是双向成对关系，如果普通联通点数量为奇数，说明普通联通点计算或合并逻辑错误。
+- `cudaPoints.Length / 3` 必须与各类路径点角色数量满足合并后的数量关系。
 - 如果上述数量关系不成立，说明派生点计算或合并逻辑错误，系统应直接报错，不得继续调用 CUDA。
+
+CUDA 点数量与路径点角色数量的核对规则如下：
+
+```text
+cudaPointCount = cudaPoints.Length / 3
+
+H = harvestPointCount
+F = firstPathPointCount
+T = terminalLinkPointCount
+O = ordinaryLinkPointCount
+P = purchasePointCount
+
+overlapCount = 所有 CUDA 点中，因同一 (circleIndex, pointIndex) 叠加多个角色而多算出来的角色数量
+
+cudaPointCount = H + F + T + O + P - overlapCount
+```
+
+其中，单个 CUDA 点的角色数量只按以下编码取模计算：
+
+```text
+pointType % 2 == 0
+pointType % 3 == 0
+pointType % 5 == 0
+pointType % 7 == 0
+pointType % 11 == 0
+```
+
+若某个 CUDA 点同时满足多个角色条件，则该点在 `H + F + T + O + P` 中会被重复计数；`overlapCount` 用于扣除这些重复计数。例如 `pointType = 6` 同时表示收割点和第一路径点，角色数量为 `2`，因此该点产生 `1` 个 `overlapCount`。数量核对只负责确认合并后的 CUDA 点数量是否与角色计数相符，不额外判断角色叠加是否具备业务合法性；业务合法性由占用型角色互斥规则负责。
 
 `connect` 用于描述 CUDA 点集中的特殊跳转关系，其长度必须等于 CUDA 点数量：
 
@@ -418,6 +512,14 @@ connect.Length = cudaPoints.Length / 3
 - 普通联通关系中的两个端点都必须能在排序后的点集中找到；如果找不到，应直接报错。
 - 同一个 CUDA 点不能被分配到两个不同的 `connect` 目标；如果发生冲突，应直接报错。
 
+传入 CUDA 前，还必须对最终形成的 `connect` 数组做一致性校验：
+
+- `connect[i]` 只能等于 `-1`，或落在 `[0, pointCount - 1]` 范围内；如果目标序号越界，系统应直接报错，不得继续调用 CUDA。
+- 如果 `connect[i] != -1`，则第 `i` 个 CUDA 点必须是末尾联通点或普通联通点，即 `pointType % 5 == 0` 或 `pointType % 7 == 0`；其他类型的点不能拥有特殊跳转目标。
+- 如果第 `i` 个 CUDA 点是末尾联通点，即 `pointType % 5 == 0`，则 `connect[i]` 的目标点必须属于同一个 `circleIndex`，且目标点的 `pointIndex` 必须等于 `0`。
+- 如果第 `i` 个 CUDA 点是普通联通点，即 `pointType % 7 == 0`，则 `connect[i]` 的目标点也必须是普通联通点，且二者必须属于不同圆。
+- 普通联通关系必须是双向的：设 `connect[i] = j`，则必须满足 `connect[j] = i`。
+
 交易点 `tradingPoints` 是 CUDA 路径计算中的起点或终点候选。交易点由排序后的 CUDA 点序号组成，不保存圆内 `pointIndex`：
 
 ```text
@@ -427,13 +529,229 @@ pointType % 11 == 0 表示采购点
 
 满足上述任一条件的点都应加入 `tradingPoints`。因此，`tradingPoints` 中保存的是排序后的点序号 `i`，对应的点数据位于 `cudaPoints[i * 3]` 开始的三个 `int`。
 
-`parallelStartPointCount` 表示一次 CUDA 并行计算多少个起点。构建 `lastFP` 时，应按当前批次的起点数量和交易点数量初始化：
+传入 CUDA 前，必须校验 `tradingPoints`：
+
+- `tradingPoints.Count` 必须等于 `harvestPointCount + purchasePointCount`。当前占用规则下，收割点和采购点互斥，不允许同一个 CUDA 点同时作为收割点和采购点。
+- `tradingPoints` 必须按 CUDA 点序号升序排列，且不能包含重复点；如果非升序或存在重复，系统应直接报错，不得继续调用 CUDA。
+- `tradingPoints` 必须是“全部且仅有”的交易点集合：CPU 侧应扫描 `cudaPoints` 中所有满足 `pointType % 2 == 0` 或 `pointType % 11 == 0` 的 CUDA 点序号，并要求扫描结果与 `tradingPoints` 完全一致。
+
+`parallelStartPointCount` 表示一次 CUDA 并行计算多少个起点。最后一批交易点数量可能不足 `parallelStartPointCount`，因此实际批次数量记为：
+
+`parallelStartPointCount` 必须大于 `0`。如果 `parallelStartPointCount <= 0`，系统应直接报错，不得继续构建 `lastFP`，也不得调用 CUDA。
 
 ```text
-lastFP.Length = tradingPoints.Count * parallelStartPointCount
+batchStartPointCount = min(parallelStartPointCount, tradingPoints.Count - calIndexStarted)
 ```
 
-`lastFP` 默认值为 `-1`。对于当前批次中的每一个起点，应在对应位置写入该起点的 CUDA 点序号，用于表示该起点当前路径的最后一个地址。`lastFP` 中保存的值同样是排序后的 CUDA 点序号，而不是圆内 `pointIndex`，也不是 `cudaPoints` 的字节偏移或三元组偏移。
+构建当前批次前，必须校验批次范围：
+
+- `calIndexStarted` 必须落在 `[0, tradingPoints.Count]` 范围内。
+- `batchStartPointCount` 必须大于 `0`。
+- `calIndexStarted + batchStartPointCount` 不能大于 `tradingPoints.Count`；如果越界，系统应直接报错，不得继续构建 `lastFP`，也不得调用 CUDA。
+
+构建 `lastFP` 时，必须按“全部 CUDA 点数量 × 当前批次起点数量”初始化，而不是按交易点数量初始化：
+
+```text
+pointCount = cudaPoints.Length / 3
+lastFP.Length = pointCount * batchStartPointCount
+```
+
+传入 CUDA 前，必须校验 `lastFP.Length` 与当前批次严格匹配，即 `lastFP.Length == pointCount * batchStartPointCount`。若长度不匹配，说明 `lastFP` 无法按当前批次切分为完整的前驱表，系统应直接报错，不得继续调用 CUDA。
+
+`lastFP` 是 CUDA 路径计算的前驱表，同时也是 CUDA 的回写结果数组。它的下标含义如下：
+
+```text
+lastFP[unitIndex * pointCount + pointIndex] = previousPointIndex
+```
+
+其中：
+
+- `unitIndex` 表示当前批次中的第几个并行起点，取值范围为 `0 <= unitIndex < batchStartPointCount`。
+- `pointIndex` 表示排序后的 CUDA 点序号，不是圆内路径点编号。
+- `previousPointIndex` 表示到达 `pointIndex` 时的上一个 CUDA 点序号。
+- `previousPointIndex = -1` 表示该点尚未从当前起点到达。
+
+`lastFP` 默认值为 `-1`。对于当前批次中的每一个交易起点，必须先确认该点满足交易点判定规则，即 `pointType % 2 == 0` 或 `pointType % 11 == 0`。确认后，将该起点标记为已到达：
+
+```text
+startPointIndex = tradingPoints[calIndexStarted + unitIndex]
+lastFP[unitIndex * pointCount + startPointIndex] = startPointIndex
+```
+
+起点的前驱记录为自身，表示路径回溯到该点时结束。`lastFP` 中保存的所有值都必须是排序后的 CUDA 点序号，不能使用圆内 `pointIndex`，也不能使用 `cudaPoints` 的字节偏移或三元组偏移。
+
+传入 CUDA 前，必须校验 `lastFP` 的初始化状态：
+
+- 每个 `unit` 中只能有一个初始已到达点。
+- 该初始已到达点必须满足交易点判定规则，即 `pointType % 2 == 0` 或 `pointType % 11 == 0`。
+- 该初始已到达点的前驱值必须等于自身，即 `lastFP[unitBase + startPointIndex] = startPointIndex`。
+- 同一个 `unit` 中，除起点以外的其他位置必须全部为 `-1`。
+
+当前公开的 C# 调用入口和 DLL 导出入口不把 `passedLength` 作为 CPU 侧入参。`passedLength` 是 CUDA 原生 `Cal` 内部维护的数组，长度必须等于 `lastFP.Length`，并在每批 CUDA 计算开始时初始化为 `0`。如果后续将 `passedLength` 暴露为 CPU 侧入参，也必须沿用该长度和初始化规则；如果长度不一致，系统应直接报错，不得继续 CUDA 计算。
+
+CPU 侧必须提供统一的 CUDA 入参包校验入口。任何准备调用 CUDA 的业务入口，都必须先通过该统一校验入口完成以下校验：排序后的派生点、路径点数量、`cudaPoints` 三元组内容、`connect`、`tradingPoints`、当前批次范围和 `lastFP` 初始化状态。不得绕过统一校验入口，直接使用仅包含 `cudaPoints`、`lastFP`、`connect` 的低级 DLL 调用。
+
+#### 2.8.3 CUDA 路径计算规则
+
+CUDA 路径计算的目标是：以交易点为起点，分批计算每个交易点到其他交易点的可达路径，并通过 `lastFP` 前驱表记录路径回溯关系。
+
+交易点包括：
+
+- 全场唯一收割点，即 `pointType % 2 == 0` 的 CUDA 点。
+- 所有采购点，即 `pointType % 11 == 0` 的 CUDA 点。
+
+CUDA 每一批可以同时计算多个起点。每个起点对应一个独立的计算单元，本文档中称为 `unit`。
+
+CUDA 计算函数输入为：
+
+```text
+cudaPoints: int[]，格式为 [circleIndex, pointIndex, pointType, ...]
+connect: int[]，长度为 pointCount
+lastFP: int[]，长度为 pointCount * batchStartPointCount
+```
+
+当前 C# 封装层应在完成统一业务校验后，调用低级 DLL 入口：
+
+```text
+Calpath_AcceptPoints(cudaPoints, cudaPoints.Length, lastFP, lastFP.Length, connect)
+```
+
+低级 DLL 入口只接收 `cudaPoints`、`lastFP`、`connect` 三组数组和对应长度；`passedLength`、`minStepResult`、`lastFPOut` 等辅助数组均由 CUDA 原生 `Cal` 在内部创建和释放。
+
+当前代码中的 C# 封装类为 `CalpathCuda`，其 DLL 路径由 `CalpathCuda.DllPath` 指定。当前实现指向：
+
+```text
+E:\Project\tradeRobot\sxtgyrq\tradeRobot\CUDA\Calpath\x64\Debug\Calpath.dll
+```
+
+如果 DLL 文件不存在，`GENERATE` 模式应提示 CUDA DLL 未找到，并不继续执行 CUDA 路径计算。
+
+CUDA DLL 还应导出 `Calpath_GetParallelStartPointRecommendation`，用于根据当前 GPU 可用显存和 `cudaPoints.Length` 估算一次可并行计算的起点数量。C# 侧调用成功时，应显示：
+
+- GPU 满负荷并行起点数量。
+- 推荐并行起点数量，当前按满负荷值的约 `80%` 计算。
+
+如果推荐值不可用，C# 侧使用默认 `parallelStartPointCount = 3`，并允许用户在控制台输入覆盖值。
+
+其中：
+
+```text
+pointCount = cudaPoints.Length / 3
+batchStartPointCount = lastFP.Length / pointCount
+```
+
+CUDA 计算函数输出为：
+
+```text
+status: int
+lastFP: int[]，原数组被回写为路径前驱表结果
+```
+
+返回规则：
+
+- `status = 0` 表示低级 DLL 入口参数校验通过，并且最终 `lastFP` 回写到 CPU 数组成功。
+- `status != 0` 表示入口参数、原生初始化或最终回写失败，调用方应直接报错，不得继续使用本批结果。
+- CUDA 原生 `Cal` 内部计算过程中如发生 CUDA 错误，应记录内部错误状态并停止本批循环；当前公开结果仍以低级 DLL 返回值和回写后的 `lastFP` 为准。
+- `lastFP` 作为输入时用于标记每个并行起点；作为输出时保存从每个起点出发到各 CUDA 点的前驱关系。
+
+`lastFP` 的下标含义如下：
+
+```text
+unitBase = unitIndex * pointCount
+lastFP[unitBase + pointIndex] = previousPointIndex
+```
+
+其中：
+
+- `unitIndex` 表示当前批次中的第几个起点。
+- `pointIndex` 表示排序后的 CUDA 点序号，不是圆内路径点编号。
+- `previousPointIndex` 表示到达当前点时的上一个 CUDA 点序号。
+- `previousPointIndex = -1` 表示当前起点尚未到达该点。
+- 起点本身的前驱记录为自身，即 `lastFP[unitBase + startPointIndex] = startPointIndex`。
+
+`lastFP` 是真实路径前驱表，不只是“是否到达”的布尔数组。非交易点虽然不是最终业务目标，但可能成为交易点之间路径回溯时的上一路口。因此 CUDA 计算过程中不得为了判断完成状态而清空、覆盖或简化非交易点在 `lastFP` 中的前驱记录。
+
+CUDA 路径计算参照 HM_6 的分阶段迭代模型执行。单轮计算顺序如下：
+
+```text
+1. CalculateMinStep：根据当前 lastFP 找出本轮可推进的最小步长；该步骤内部会调用 getMinStepFF 和 FindMin。
+2. Reduce：把本轮最小步长对应的路径推进写回 lastFP。
+3. Copy：复制当前 lastFP 到 lastFPOut，供完成状态判断使用。
+4. NotFinished：判断本批所有交易点是否均已到达。
+```
+
+上述步骤循环执行，直到 `NotFinished` 返回 `false`，表示本批每一个起点都已经到达所有交易点。
+
+当前 CUDA 原生 `Cal` 在单批计算开始时，会为 `minStepResult` 和 `minStepResultOnOff` 各分配一个长度为 `lastFP.Length` 的 GPU 数组，并在本批循环结束后统一释放。它们不在每轮 `CalculateMinStep -> Reduce -> Copy -> NotFinished` 循环中反复 `cudaMalloc/cudaFree`，以减少分配开销；但数组内容的业务含义仍然只服务于当前迭代轮次。
+
+当前主路径计算中的 `ThreadCount` 为 `512`；与 GPU 并行起点推荐相关的辅助 kernel 使用独立的线程配置。`ShowNotFinishedProgress` 当前默认值为 `false`，生产或大数据量计算时不输出每组交易点完成数量；调试时可改为 `true`，此时 `NotFinished` 会额外拷贝 `lastFPOut` 和 `cudaPoints` 到 CPU 并打印每组交易点完成进度。`SynchronizeEveryKernel` 当前默认值为 `true`，用于更早暴露 CUDA kernel 错误，便于调试。
+
+`passedLength` 是同一批 CUDA 计算内持续存在的原生内部数组，长度同样等于 `lastFP.Length`。它在本批计算开始时初始化为 `0`，用于记录每个 `lastFP` 下标在当前圆内边上已经推进的长度。
+
+`CalculateMinStep` 的职责是扫描当前批次内的每个计算单元，依据 `lastFP` 判断哪些点已经到达，并计算本轮从已到达点继续向前推进所需的候选步长。不可推进的位置应写入 `MaxValue`，表示本轮不可作为最小步长候选。由于 `lastFP` 按 `pointCount * batchStartPointCount` 展开，相关 kernel 的线程覆盖范围必须按 `lastFPLengthValue` 计算，不能只按单个 `pointCount` 计算。
+
+`FindMin` 是 `CalculateMinStep` 内部调用的归约步骤。它参照 HM_6 的归约方式，在每个 `unit` 内从候选步长中找出本轮最小推进步长。归约只用于找本轮最小步长，不直接修改路径前驱表。归约完成后，每个 `unit` 的最小推进步长保存在该 `unit` 的起始位置，即 `minStepResult[unitBase]`。
+
+`Reduce` 的职责是根据本轮最小步长推进路径，并写回真实的 `lastFP`：
+
+- 当某个目标 CUDA 点被本轮首次到达时，应写入该目标点的前驱点序号。
+- 如果到达的目标点存在 `connect` 跳转关系，则当前实现直接将 `connect` 目标标记为到达，并将其前驱写为触发跳转的 CUDA 点序号。
+- `Reduce` 同时会更新 `passedLength`；如果本轮最小推进步长为 `MaxValue` 或累计长度可能溢出 `int.MaxValue`，应按错误或不可推进状态处理，不能继续做普通整数相加。
+- 写入 `lastFP` 的值必须始终是排序后的 CUDA 点序号。
+- 不得使用圆内 `pointIndex`、`cudaPoints` 数组偏移或字节偏移作为 `lastFP` 值。
+
+`connect` 跳转边按以下规则参与 CUDA 路径计算：
+
+- `connect[i] = -1` 表示第 `i` 个 CUDA 点没有特殊跳转边。
+- `connect[i] = j` 表示第 `i` 个 CUDA 点可以跳转到第 `j` 个 CUDA 点。
+- 末尾联通点的 `connect` 是同圆内从 `n - 1` 到 `0` 的单向跳转。
+- 普通联通点的 `connect` 是圆间普通联通关系形成的双向跳转。
+- `connect` 中保存的所有值都必须是排序后的 CUDA 点序号。
+
+圆内行走边按排序后的点集和圆内 `pointIndex` 计算：
+
+- 如果排序后第 `i` 个 CUDA 点和第 `i + 1` 个 CUDA 点属于同一个 `circleIndex`，则可以从 `i` 沿当前圆允许方向走向 `i + 1`。
+- 圆内边的长度以两个点的圆内 `pointIndex` 差值为基础计算。
+- 如果第 `i + 1` 个 CUDA 点不存在，或二者不属于同一个 `circleIndex`，则不能通过普通圆内边从 `i` 走向 `i + 1`。
+- 从末尾联通点回到同圆第一路径点，不通过 `i + 1` 推导，而通过 `connect` 表示。
+
+`NotFinished` 的职责是判断本批路径计算是否已经完成。完成条件为：对当前批次中的每一个 `unit`，所有交易点对应的 `lastFP[unitBase + tradingPointIndex]` 都必须不是 `-1`。
+
+`NotFinished` 必须遵守以下限制：
+
+- 只能判断交易点是否全部到达。
+- 非交易点不能作为完成条件的目标点。
+- 非交易点在真实 `lastFP` 中的前驱记录不能被修改，因为它可能用于路径回溯。
+- 如果为了提高判断效率需要使用归约数组，只能使用临时数组。
+- 临时数组中可以把非交易点视为“已完成”，但该处理不得写回真实 `lastFP`。
+- 判断完成状态后，真实 `lastFP` 必须仍然保留所有已到达点的前驱关系，包括非交易点。
+
+`NotFinished` 可参照 HM_6 的完成判断方式：先构造用于判断的临时数组，再在每个 `unit` 内做最小值归约。当前代码在 `Cal` 构造阶段一次性分配并复用 `finishedStateGpu`、`unitFinishedGpu` 和 CPU 端 `hostUnitFinished`，避免每轮重复分配。归约后只将每个 `unit` 的完成状态拷回 CPU，而不是每轮都把完整 `finishedState` 拷回 CPU。若某个 `unit` 归约后仍存在交易点状态为 `-1`，则说明该起点尚未到达所有交易点，`NotFinished` 返回 `true`；否则返回 `false`。
+
+C# 侧提供 `CalpathReference.CalculatePaths(cudaPoints, lastFP, connect)` 作为测试参考算法。该参考实现使用与 CUDA 当前路径推进相同的核心规则计算 `lastFP`，用于单元测试对比 CUDA 回写结果，不作为生产计算入口。
+
+`NotFinished` 中的 `true` 分为两种情况：
+
+- 正常未完成：至少一个 `unit` 还有交易点没有到达，且内部错误状态为 `0`，外层循环应继续下一轮。
+- 异常未完成：完成状态判断过程中发生长度非法、CUDA 分配失败、kernel 启动失败、同步失败或 CPU 临时数组分配失败等错误；此时应记录内部错误状态，外层循环检测到错误状态后应退出本批计算。
+
+对于任意起点 `startPointIndex` 和目标交易点 `targetPointIndex`：
+
+- 如果 `lastFP[unitBase + targetPointIndex] == -1`，表示该目标交易点不可达，本批计算结果无效或业务不可用。
+- 如果 `lastFP[unitBase + targetPointIndex] != -1`，表示该目标交易点可达，可以通过前驱表反向回溯路径。
+- 如果 `targetPointIndex == startPointIndex`，则 `lastFP` 中记录为自身，仅用于标记起点和回溯终止；统计“到其他交易点”的业务结果时可以跳过该自路径。
+
+路径回溯规则如下：
+
+```text
+current = targetPointIndex
+previous = lastFP[unitBase + current]
+重复令 current = previous，直到 previous == current 到达起点
+```
+
+回溯得到的是从目标点反向到起点的 CUDA 点序列；业务如需正向路径，应将该序列反转。
+
+当前 CUDA 接口的核心输出为 `lastFP` 前驱表。当前阶段不直接返回最终路径距离、经过圆的累计弧度或当前路过金额；这些交易计算数据可以在得到前驱路径后由业务层继续计算。如果后续需要 CUDA 直接返回距离、弧度或交易金额，应另行扩展接口并补充需求。
 
 ### 2.9 路径行走规则
 
@@ -610,6 +928,136 @@ distance(O, P) = sqrt(x^2 + y^2)
 
 两段路径都必须遵守路径行走规则和联通关系规则。
 
+#### 2.17.1 程序入口模式
+
+当前控制台程序启动后提供三种入口模式：
+
+```text
+GENERATE          生成圆并计算路径
+CHECK             检查已有路径并输出路线 DXF
+WEB               启动 Web 服务
+```
+
+- `GENERATE` 模式调用 `GenerateCircle()`，生成或补齐 `Circle.bin`，随后计算派生点、构建 `cudaPoints`、`connect`、`tradingPoints` 和分批 `lastFP`，并调用 CUDA DLL 计算路径。
+- `CHECK` 模式不重新生成圆；它读取当前运行目录下已有的 `Circle.bin` 和对应的路线结果文件，按用户输入的起点和终点回溯路径，并输出路线 DXF。
+- `WEB` 模式启动本地 Web 服务，用浏览器展示当前 `Circle.bin`、派生点、联通关系、采购点分配和可选路线。
+
+#### 2.17.2 Route.bin 路径结果文件
+
+`GENERATE` 模式完成 CUDA 路径计算后，需要把每个交易点作为起点得到的 `lastFP` 前驱表写入路线结果文件。路线结果文件命名规则如下：
+
+```text
+<Circle.bin 文件内容的 SHA256 小写十六进制哈希>Route.bin
+```
+
+路线结果文件与 `Circle.bin` 位于同一目录。这样当 `Circle.bin` 内容变化时，路线文件名也会变化，避免不同圆集合的路径结果互相覆盖。
+
+路线结果文件的内容是连续 `int` 数组，按交易点起点顺序逐行写入：
+
+```text
+routeRowCount = tradingPoints.Count
+routeColumnCount = cudaPoints.Length / 3
+routeValueCount = routeRowCount * routeColumnCount
+```
+
+每一行对应一个交易起点的 `lastFP` 前驱表：
+
+```text
+route[startTradingRow, pointIndex] = previousPointIndex
+```
+
+其中：
+
+- `startTradingRow` 是起点交易点在 `tradingPoints` 中的行号。
+- `pointIndex` 是排序后的 CUDA 点序号。
+- `previousPointIndex` 是回溯路径时的上一个 CUDA 点序号。
+- `previousPointIndex = -1` 表示从当前起点无法到达该点。
+- `previousPointIndex = pointIndex` 表示当前点是本行起点，回溯到此结束。
+
+写入路线结果文件时，系统应先写入临时文件 `<Route.bin>.tmp`；全部批次写完且数量校验通过后，再移动为正式路线文件。写入过程中应输出进度：
+
+```text
+Route write progress: 已写入数量/总数量, 百分比%
+```
+
+写入完成后，必须校验实际写入数量等于 `tradingPoints.Count * pointCount`。如果数量不一致，系统应报错，不得把临时文件当作有效路线结果。
+
+#### 2.17.3 CHECK 路径检查与路线 DXF
+
+`CHECK` 模式用于检查两个交易点之间的已计算路径，并把该路径叠加输出到 DXF 文件中。
+
+`CHECK` 模式下，起点和终点分两步输入：
+
+```text
+先输入起点
+再输入终点
+```
+
+选择器规则如下：
+
+- `0` 表示全场唯一收割点。
+- 大于 `0` 的整数 `n` 表示第 `n - 1` 个圆的采购点。
+- 负数无效，系统应直接报错。
+
+选择器解析完成后，系统应：
+
+1. 将起点选择器和终点选择器解析为排序后的 CUDA 点序号。
+2. 根据起点交易点在 `tradingPoints` 中的位置读取路线结果文件中的对应一行。
+3. 从目标点开始沿 `lastFP` 反向回溯，直到回到起点。
+4. 如果回溯过程中出现越界、环路、不可达或没有回到起点，应直接报错。
+5. 将反向结果翻转为正向路径点序列。
+6. 输出路线 DXF 文件，默认文件名为 `CircleRoute_<start>_<target>.dxf`。
+
+如果目标 DXF 文件被 CAD 等程序占用，系统应自动追加时间戳后缀，选择一个可写的新文件名。
+
+路线 DXF 应在原有圆图形基础上叠加路线：
+
+- 做多圆使用绿色图层，做空圆使用红色图层。
+- 普通联通线使用黄色，末尾联通线和采购箭头使用橙色。
+- 路径线使用独立 `RoutePath` 图层，并使用显眼颜色。
+- 同一圆内相邻路径点之间的路线应优先画为圆弧；跨圆联通、末尾联通或不属于同一圆的路径段画为直线。
+- 普通联通点重合时，使用直径 `0.5` 的小圆标记。
+- 普通联通线长度大于 `0` 且不超过 `0.5` 时，应沿连线方向两端各延长 `0.25`，提高 CAD 可见性。
+
+普通 `DrawToDxf()` 模式下，圆、圆标签和该圆采购箭头应组成同一个 DXF block，便于在 CAD 中整体选中；路线 DXF 模式下，为避免大图卡顿，允许直接写圆、文字、采购箭头和路线实体，不强制使用 block。
+
+#### 2.17.4 Web / Three.js 可视化
+
+`WEB` 模式启动本地服务：
+
+```text
+http://localhost:5055/
+```
+
+服务端接口包括：
+
+- `/` 或 `/index.html`：返回 Three.js 页面。
+- `/api/scene?start=<起点选择器>&target=<终点选择器>`：返回当前场景 JSON。
+
+Web 场景数据应包含：
+
+- `Circle.bin` 路径。
+- 对应的路线结果文件路径。
+- 圆列表、方向、半径、路径点数量。
+- 派生点列表和角色编码。
+- 普通联通关系。
+- 末尾联通关系。
+- 采购点分配关系。
+- `connect` 跳转关系。
+- 当前起点到终点的路线点序列；如果路线不可用，返回 `routeError`。
+
+Three.js 页面应支持：
+
+- 缩放和移动视图。
+- 只显示圆边界，不填充圆面。
+- 文字、联通关系、采购箭头三个图层开关。
+- 当圆数量大于 `50` 且用户尚未手动设置图层偏好时，默认关闭文字、联通关系和采购箭头，以提高显示性能。
+- 标签右上角与对应圆心对齐。
+- 点击圆标签或采购箭头时，对应圆边界闪烁。
+- 路径使用比普通圆边和联通线更醒目的多层线条显示。
+- “适配线宽”按钮用于按当前视图缩放比例重建圆边、联通线、采购线和路径线的显示粗细；缩放和移动过程中不自动重建线宽，避免交互卡顿。
+- “遍历”按钮用于自动遍历所有起点和终点组合；起点和终点不能相同，每组路径显示约 `5` 秒后切换到下一组，遍历过程中可以停止。
+
 ### 2.18 做多尺度规则
 
 当 `收割点 -> 采购点 -> 收割点` 的完整路径经过做多圆时，系统需要根据路径在该做多圆上的累计弧度，决定做多的尺度。
@@ -671,9 +1119,177 @@ distance(O, P) = sqrt(x^2 + y^2)
 
 接近爆仓的判定规则和补充保证金的金额计算规则待进一步确认。
 
+### 2.21 K 线五行属性规则
+
+系统后续需要根据历史 K 线形态，为下一根 K 线定义五行属性。当前阶段已定义 `金`、`木`、`水`、`火`、`土` 五种属性。
+
+K 线五行属性不是赋给用于判断的历史窗口本身，而是由历史窗口计算得到，并赋给该窗口之后的下一根 K 线。
+
+当前规则以连续 `24` 根 K 线作为一个判断窗口；这里一般指小时图，即连续 `24` 根小时 K 线。
+
+五行属性判定必须覆盖所有可能的 `24` 根 K 线窗口，并且每个窗口只能得到一种五行属性。为避免边界重叠，必须按照本节定义的顺序进行判定。
+
+设窗口内第一根 K 线的开盘价为 `P0`，窗口内第 `24` 根 K 线的收盘价为 `C23`，窗口内所有 `24` 根 K 线最低价的最小值为 `Lmin`，窗口内所有 `24` 根 K 线最高价的最大值为 `Hmax`。
+
+上下边界定义如下：
+
+```text
+LowerBound = P0 * 45 / 46
+UpperBound = P0 * 46 / 45
+```
+
+边界规则如下：
+
+- `C23 > UpperBound` 表示最后收盘价突破上限。
+- `C23 < LowerBound` 表示最后收盘价跌破下限。
+- `LowerBound <= C23 <= UpperBound` 表示最后收盘价位于上下边界之间，包含刚好等于边界的情况。
+- `High > UpperBound` 表示某根 K 线突破上限。
+- `Low < LowerBound` 表示某根 K 线跌破下限。
+- `High == UpperBound` 或 `Low == LowerBound` 不算突破，只算触及边界。
+
+第一根突破 K 线定义如下：在窗口内按时间顺序从第 `1` 根查找到第 `24` 根，第一根满足 `High > UpperBound` 或 `Low < LowerBound` 的 K 线，就是第一根突破 K 线。
+
+#### 2.21.1 金属性 K 线
+
+若满足以下条件：
+
+```text
+C23 > UpperBound
+```
+
+则定义该窗口之后的下一根 K 线，即第 `25` 根 K 线，其五行属性为 `金`。
+
+换成滑动窗口表达：
+
+- 若以第 `i` 根 K 线作为窗口第一根，则窗口范围为第 `i` 根到第 `i + 23` 根。
+- `P0 = Open[i]`。
+- `C23 = Close[i + 23]`。
+- `UpperBound = P0 * 46 / 45`。
+- 如果 `C23 > UpperBound`，则第 `i + 24` 根 K 线的五行属性为 `金`。
+
+该规则的业务含义是：过去 `24` 根 K 线最终收盘已经突破上限，说明上涨结果明确，因此将下一根 K 线标记为 `金`。若过程中最低价没有跌破 `LowerBound`，则属于更稳定的金属性形态；但为了让五行属性覆盖所有情况，只要最终收盘突破上限，就归入 `金`。
+
+#### 2.21.2 水属性 K 线
+
+若满足以下条件：
+
+```text
+C23 < LowerBound
+```
+
+则定义该窗口之后的下一根 K 线，即第 `25` 根 K 线，其五行属性为 `水`。
+
+换成滑动窗口表达：
+
+- 若以第 `i` 根 K 线作为窗口第一根，则窗口范围为第 `i` 根到第 `i + 23` 根。
+- `P0 = Open[i]`。
+- `C23 = Close[i + 23]`。
+- `LowerBound = P0 * 45 / 46`。
+- 如果 `C23 < LowerBound`，则第 `i + 24` 根 K 线的五行属性为 `水`。
+
+该规则的业务含义是：过去 `24` 根 K 线最终收盘已经跌破下限，说明下跌结果明确，因此将下一根 K 线标记为 `水`。若过程中最高价没有突破 `UpperBound`，则属于更稳定的水属性形态；但为了让五行属性覆盖所有情况，只要最终收盘跌破下限，就归入 `水`。
+
+#### 2.21.3 土属性 K 线
+
+若同时满足以下条件：
+
+```text
+Lmin >= P0 * 45 / 46
+Hmax <= P0 * 46 / 45
+```
+
+则定义该窗口之后的下一根 K 线，即第 `25` 根 K 线，其五行属性为 `土`。
+
+换成滑动窗口表达：
+
+- 若以第 `i` 根 K 线作为窗口第一根，则窗口范围为第 `i` 根到第 `i + 23` 根。
+- `P0 = Open[i]`。
+- `Lmin = min(Low[i], Low[i + 1], ..., Low[i + 23])`。
+- `Hmax = max(High[i], High[i + 1], ..., High[i + 23])`。
+- 如果 `Lmin >= P0 * 45 / 46` 且 `Hmax <= P0 * 46 / 45`，则第 `i + 24` 根 K 线的五行属性为 `土`。
+
+该规则的业务含义是：过去 `24` 根 K 线的最高价和最低价都被限制在第一根开盘价的上下边界之间，整体表现为区间震荡、没有明确向上突破或向下破位，因此将下一根 K 线标记为 `土`。
+
+#### 2.21.4 火属性 K 线
+
+火属性用于描述：最后收盘价位于上下边界之间，但窗口中途已经先发生向上突破，或者第一根突破 K 线同时突破上下边界。
+
+若同时满足以下条件：
+
+```text
+LowerBound <= C23 <= UpperBound
+窗口中至少存在一根 K 线满足 High > UpperBound 或 Low < LowerBound
+按时间顺序找到第一根突破 K 线
+第一根突破 K 线满足 High > UpperBound
+```
+
+则定义该窗口之后的下一根 K 线，即第 `25` 根 K 线，其五行属性为 `火`。
+
+- 如果第一根突破 K 线只突破上限，即 `High > UpperBound` 且 `Low >= LowerBound`，则定义为 `火`。
+- 如果第一根突破 K 线同时突破上限和下限，即 `High > UpperBound` 且 `Low < LowerBound`，也定义为 `火`。
+
+换成滑动窗口表达：
+
+- 若以第 `i` 根 K 线作为窗口第一根，则窗口范围为第 `i` 根到第 `i + 23` 根。
+- `P0 = Open[i]`。
+- `LowerBound = P0 * 45 / 46`。
+- `UpperBound = P0 * 46 / 45`。
+- `C23 = Close[i + 23]`。
+- 若 `LowerBound <= C23 <= UpperBound`，并且窗口内第一根突破 K 线满足 `High > UpperBound`，则第 `i + 24` 根 K 线的五行属性为 `火`。
+
+该规则的业务含义是：过去 `24` 根 K 线最后回到区间内，但中途率先向上冲破上沿，表现为先扬后收敛，因此将下一根 K 线标记为 `火`。
+
+#### 2.21.5 木属性 K 线
+
+木属性用于描述：最后收盘价位于上下边界之间，但窗口中途第一根突破 K 线是向下突破下限。
+
+若同时满足以下条件：
+
+```text
+LowerBound <= C23 <= UpperBound
+窗口中至少存在一根 K 线满足 High > UpperBound 或 Low < LowerBound
+按时间顺序找到第一根突破 K 线
+第一根突破 K 线满足 Low < LowerBound 且 High <= UpperBound
+```
+
+则定义该窗口之后的下一根 K 线，即第 `25` 根 K 线，其五行属性为 `木`。
+
+换成滑动窗口表达：
+
+- 若以第 `i` 根 K 线作为窗口第一根，则窗口范围为第 `i` 根到第 `i + 23` 根。
+- `P0 = Open[i]`。
+- `LowerBound = P0 * 45 / 46`。
+- `UpperBound = P0 * 46 / 45`。
+- `C23 = Close[i + 23]`。
+- 若 `LowerBound <= C23 <= UpperBound`，并且窗口内第一根突破 K 线满足 `Low < LowerBound` 且 `High <= UpperBound`，则第 `i + 24` 根 K 线的五行属性为 `木`。
+
+该规则的业务含义是：过去 `24` 根 K 线最后回到区间内，但中途率先向下跌破下沿，表现为先探底后收回，因此将下一根 K 线标记为 `木`。
+
+#### 2.21.6 五行属性完整判定顺序
+
+实际判定时必须按以下顺序执行：
+
+1. 若 `C23 > UpperBound`，则下一根 K 线为 `金`。
+2. 否则，若 `C23 < LowerBound`，则下一根 K 线为 `水`。
+3. 否则，此时必然满足 `LowerBound <= C23 <= UpperBound`。
+4. 若 `Lmin >= LowerBound` 且 `Hmax <= UpperBound`，则下一根 K 线为 `土`。
+5. 否则，说明窗口内至少存在突破 K 线；按时间顺序找到第一根突破 K 线。
+6. 若第一根突破 K 线满足 `High > UpperBound`，则下一根 K 线为 `火`。
+7. 否则，第一根突破 K 线必然只满足 `Low < LowerBound` 且 `High <= UpperBound`，则下一根 K 线为 `木`。
+
+该顺序可以覆盖所有情况：
+
+- 最后收盘价只有三种位置：高于上限、低于下限、位于上下限之间。
+- 高于上限归 `金`。
+- 低于下限归 `水`。
+- 位于上下限之间时，如果整个窗口没有突破上下限，归 `土`。
+- 位于上下限之间且窗口发生过突破时，第一根突破 K 线要么突破上限，要么只突破下限；突破上限归 `火`，只突破下限归 `木`。
+
+当前已定义 `金`、`水`、`土`、`火`、`木` 五种 K 线五行属性。
+
 ## 3. 验收标准
 
-- 能够生成指定数量 `N` 的圆；当前默认 `N = 10000`，且该值可作为常量调整。
+- 能够生成指定数量 `N` 的圆；当前代码默认 `N = 256`，且该值可作为常量调整。调试阶段允许先使用较小的 `N` 验证生成、派生点和 CUDA 计算流程，确认无误后再逐步提高到目标数量 `10000`。
 - 每个圆都包含合法的圆心坐标和带方向的半径信息。
 - 生成结果应由 `GenerateCircle()` 方法写入 `Circle.bin`，文件包含 `N` 条记录，每条圆数据按 `a`、`b`、`r` 顺序写入三个 `int`。
 - 如果 `Circle.bin` 已存在，`GenerateCircle()` 应先读取已有圆数据；已有圆数据合法且数量不足时，应在保持整体连通的前提下补齐到目标数量。
@@ -698,17 +1314,31 @@ distance(O, P) = sqrt(x^2 + y^2)
 - `r > 0` 的圆应按逆时针方向划分并定义为做多圆，`r < 0` 的圆应按顺时针方向划分并定义为做空圆。
 - 圆被划分为 `n` 份圆弧后，应生成 `n` 个路径点；路径点按当前圆方向从极点开始编号，不生成重复终点。
 - 收割点与采购点统称为交易点；除交易点以外的其他路径点统称为流通点。
+- K 线五行运行开始时，所有交易点账户初始都拥有 `1000U`；收割点账户初始额外拥有 `210000000000` 聪，采购点账户初始拥有 `0` 聪；每个交易点账户都包含聪余额、`U` 余额、合约单列表和现货单列表。
 - 每个圆的路径点 `n - 1` 应定义为末尾联通点；末尾联通点只能单向连接回同一个圆的路径点 `0`。
 - 末尾联通点不能是收割点、普通联通点或采购点。
 - 路径点应支持角色编码：普通路径点 `1`，收割点 `2`，每个圆的第一个路径点 `3`，末尾联通点 `5`，普通联通点 `7`，采购点 `11`；同一路径点具备多个角色时，先按角色生成点，再按 `(circleIndex, pointIndex)` 合并位置相同的点，合并后 `pointType` 为各角色编码的乘积。
 - 收割点、末尾联通点、普通联通点、采购点为占用型角色，同一个路径点最多只能拥有一个占用型角色；第一个路径点只是编号为 `0` 的标记，可以叠加一个占用型角色，但不能叠加多个占用型角色。
 - 派生点应按顺序计算：全场唯一收割点、所有圆的第一路径点、所有圆的末尾联通点、所有普通联通点、所有采购点；所有输出点格式统一为 `(circleIndex, pointIndex, pointType)`。
 - 合并后的派生点集应能转换为 CUDA 使用的连续 `int[] cudaPoints`，格式固定为 `[circleIndex, pointIndex, pointType, ...]`，每 `3` 个 `int` 表示一个点；该数组只保存点集信息，不保存坐标或圆参数。
-- 调用 CUDA 计算函数前，必须将合并后的派生点按 `circleIndex`、`pointIndex`、`pointType` 升序排序；排序后的点序号即 CUDA 点序号，`cudaPoints[i * 3]` 对应第 `i` 个 CUDA 点。
+- 调用 CUDA 计算函数前，必须将合并后的派生点按 `circleIndex`、`pointIndex`、`pointType` 升序排序；排序后的点序号即 CUDA 点序号，`cudaPoints[i * 3]` 对应第 `i` 个 CUDA 点。若点集不是升序，系统应直接报错，不得继续调用 CUDA。
+- 调用 CUDA 计算函数前，合并后的派生点集中不能存在重复的 `(circleIndex, pointIndex)`；如果出现重复点，系统应直接报错，不得继续调用 CUDA。
+- 调用 CUDA 计算函数前，必须校验 `pointType` 只由 `2`、`3`、`5`、`7`、`11` 组成，且每种角色编码质因子最多出现一次，每个合并点至少包含一个有效角色；如果出现非法编码、无角色点、未知因子或重复角色因子，系统应直接报错，不得继续调用 CUDA。
+- 调用 CUDA 计算函数前，必须校验占用型角色互斥、`circleIndex` 范围、`pointIndex` 范围、第一路径点位置、末尾联通点位置，以及收割点、普通联通点、采购点不得落在 `n - 1`。
+- 调用 CUDA 计算函数前，必须校验 `cudaPoints.Length` 是 `3` 的整数倍；如果不是整数倍，系统应直接报错，不得继续调用 CUDA。
+- 调用 CUDA 计算函数前，必须校验收割点数量为 `1`，第一路径点、末尾联通点、采购点数量均等于圆数量，普通联通点数量为偶数，并校验 `cudaPointCount = H + F + T + O + P - overlapCount`；如果数量关系不成立，系统应直接报错，不得继续调用 CUDA。
 - 调用 CUDA 计算函数前，必须构建 `connect` 数组；`connect.Length = cudaPoints.Length / 3`，默认值为 `-1`，末尾联通点单向指向同圆第一路径点，普通联通点按普通联通关系双向互指，其他点保持 `-1`。
-- 构建 `connect` 时，如果存在重复 `(circleIndex, pointIndex)`、缺失跳转目标或同一 CUDA 点被分配到不同跳转目标，系统应直接报错，不得继续调用 CUDA。
-- 调用 CUDA 计算函数前，应从排序后的 CUDA 点序号中提取交易点 `tradingPoints`；`pointType % 2 == 0` 或 `pointType % 11 == 0` 的点均属于交易点。
-- 调用 CUDA 计算函数前，应按 `parallelStartPointCount` 和 `tradingPoints.Count` 构建 `lastFP`；`lastFP` 默认值为 `-1`，其中写入的地址必须是排序后的 CUDA 点序号。
+- 构建和校验 `connect` 时，如果存在重复 `(circleIndex, pointIndex)`、缺失跳转目标、同一 CUDA 点被分配到不同跳转目标、目标越界、非联通点拥有跳转目标、普通联通点没有双向互指、普通联通点目标不是普通联通点或普通联通点连接到同圆，系统应直接报错，不得继续调用 CUDA。
+- 调用 CUDA 计算函数前，应从排序后的 CUDA 点序号中提取交易点 `tradingPoints`；`pointType % 2 == 0` 或 `pointType % 11 == 0` 的点均属于交易点，`tradingPoints` 必须升序唯一，且必须与扫描 `cudaPoints` 得到的全部交易点完全一致。
+- 调用 CUDA 计算函数前，`parallelStartPointCount` 必须大于 `0`；如果小于或等于 `0`，系统应直接报错，不得继续调用 CUDA。
+- 调用 CUDA 计算函数前，必须校验 `calIndexStarted`、`batchStartPointCount` 和 `tradingPoints.Count` 的批次范围关系，防止当前批次越界。
+- 调用 CUDA 计算函数前，应按 `pointCount * batchStartPointCount` 构建 `lastFP`，其中 `pointCount = cudaPoints.Length / 3`；`lastFP.Length` 必须严格等于 `pointCount * batchStartPointCount`；`lastFP` 默认值为 `-1`，每个并行起点应写入 `lastFP[unitIndex * pointCount + startPointIndex] = startPointIndex`，且所有值必须是排序后的 CUDA 点序号。
+- 当前公开 CUDA 调用入口不接收 `passedLength`；`passedLength` 由 CUDA 原生 `Cal` 内部按 `lastFP.Length` 分配，并在本批计算开始时初始化为 `0`。
+- 调用 CUDA 计算函数前，必须通过统一 CUDA 入参包校验入口完成完整校验；不得从业务代码直接绕过完整校验调用低级三数组 DLL 入口。
+- 当前 C# 封装层应通过 `CalpathCuda.DllPath` 指向 CUDA DLL；DLL 不存在时，应输出明确提示，不得继续执行 CUDA 路径计算。
+- 如 CUDA DLL 支持并行起点推荐接口，控制台应显示 GPU 满负荷并行起点数量和约 `80%` 推荐值；推荐值不可用时，应使用默认 `parallelStartPointCount = 3` 并允许用户输入覆盖。
+- CUDA 单批计算内部应复用 `minStepResult`、`minStepResultOnOff`、`finishedStateGpu`、`unitFinishedGpu` 和 CPU 完成状态缓存，避免每轮循环重复分配；该优化不得改变 `CalculateMinStep -> Reduce -> Copy -> NotFinished` 的业务推进顺序。
+- `ShowNotFinishedProgress` 默认关闭；打开时仅用于调试输出每组交易点完成进度，不得改变真实 `lastFP` 结果。
 - 做多圆上的路径点只能按照逆时针方向行走，做空圆上的路径点只能按照顺时针方向行走。
 - 生成结果中不存在孤立圆。
 - 任意一个圆都能找到至少一个与其相交或相切的其他圆。
@@ -729,8 +1359,26 @@ distance(O, P) = sqrt(x^2 + y^2)
 - 应在所有路径点中，找到距离原点 `(0, 0)` 最近且不是末尾联通点的路径点，并将其标记为全局唯一的收割点。
 - 在整体连通、圆内有向闭环、普通联通关系双向的前提下，从收割点应能够到达任意路径点。
 - 每个采购点都必须能够通过路径点、末尾联通点和普通联通点，最终到达收割点。
+- CUDA 路径计算应以所有交易点为起点分批执行，并通过回写后的 `lastFP` 前驱表确认任意交易点到其他交易点的可达路径。
+- CUDA 路径结果应写入以 `Circle.bin` 内容 SHA256 哈希命名的 `<hash>Route.bin` 文件；写入时先使用临时文件，写入数量必须等于 `tradingPoints.Count * pointCount`，校验通过后再替换为正式路线文件。
+- 写入路线结果时应输出 `Route write progress` 形式的进度，包含已写入数量、总数量和百分比。
+- `lastFP` 是真实路径前驱表，非交易点可能作为路径回溯中的上一路口；CUDA 完成状态判断不得覆盖、清空或简化非交易点在真实 `lastFP` 中的前驱记录。
+- CUDA 单批计算应参照 HM_6 的分阶段模型执行：`CalculateMinStep（内部调用 getMinStepFF 和 FindMin） -> Reduce -> Copy -> NotFinished`，直到本批每个起点都到达所有交易点。
+- `NotFinished` 只判断交易点是否全部到达；如需归约判断，只能使用临时判断数组，不得修改真实 `lastFP`。
+- `CalpathReference.CalculatePaths` 应作为 C# 参考算法用于测试对比 CUDA `lastFP` 结果，参考算法不作为生产 CUDA 计算入口。
+- 当前 CUDA 接口的核心输出为回写后的 `lastFP` 前驱表；路径总距离、累计弧度和当前路过金额不由当前 CUDA 接口直接返回，应在得到前驱路径后由业务层继续计算，或在后续扩展 CUDA 接口。
+- `CHECK` 模式应按两步输入起点和终点；`0` 表示收割点，`n > 0` 表示第 `n - 1` 个圆的采购点。系统应能根据 `Route.bin` 回溯路径，并输出 `CircleRoute_<start>_<target>.dxf`。
+- 路线 DXF 应能显示圆、标签、采购箭头、普通联通线、末尾联通线和路径线；普通 `DrawToDxf()` 模式下圆、标签和采购箭头应组成 DXF block，路线 DXF 模式下允许直接写实体以降低 CAD 卡顿风险。
+- `WEB` 模式应启动 `http://localhost:5055/`，使用 Three.js 展示圆边界、联通关系、采购点分配和路线，并支持缩放、移动、文字/联通/采购图层开关、线宽适配、点击闪烁和自动遍历所有非相同起终点组合。
 - 对于每个采购点，应分别计算收割点到采购点的距离，以及采购点到收割点的距离。
 - 对于每个采购点，应生成 `收割点 -> 采购点 -> 收割点` 的完整路径。
 - 当完整路径经过做多圆时，应能够根据路径在该做多圆上的累计弧度 `θ` 计算做多保证金、做多名义仓位和止盈价。
 - 当完整路径经过做空圆时，应能够根据路径在该做空圆上的累计弧度 `θ` 计算做空保证金、做空名义仓位和止盈价。
 - 做多或做空仓位接近爆仓时，应能够从对应圆的可使用金额中补充保证金。
+- K 线五行属性计算应支持以连续 `24` 根 K 线作为判断窗口，并将该窗口之后的下一根 K 线标记为且只标记为一种五行属性。
+- K 线五行属性计算应使用 `LowerBound = P0 * 45 / 46` 和 `UpperBound = P0 * 46 / 45` 作为上下边界；等于边界只算触及，不算突破。
+- K 线五行属性计算应支持 `金` 属性；当 `C23 > UpperBound` 时，应将该窗口之后的下一根 K 线标记为 `金` 属性。
+- K 线五行属性计算应支持 `水` 属性；当 `C23 < LowerBound` 时，应将该窗口之后的下一根 K 线标记为 `水` 属性。
+- K 线五行属性计算应支持 `土` 属性；当 `LowerBound <= C23 <= UpperBound`，且窗口内最低价满足 `Lmin >= LowerBound`、窗口内最高价满足 `Hmax <= UpperBound` 时，应将该窗口之后的下一根 K 线标记为 `土` 属性。
+- K 线五行属性计算应支持 `火` 属性；当 `LowerBound <= C23 <= UpperBound`，且窗口内第一根突破 K 线突破上限，或同一根同时突破上限和下限时，应将该窗口之后的下一根 K 线标记为 `火` 属性。
+- K 线五行属性计算应支持 `木` 属性；当 `LowerBound <= C23 <= UpperBound`，且窗口内第一根突破 K 线只突破下限时，应将该窗口之后的下一根 K 线标记为 `木` 属性。
