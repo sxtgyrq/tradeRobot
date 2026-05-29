@@ -1,182 +1,280 @@
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
 
+#include "CircleCal.cuh"
+
 #include <stdio.h>
 
 namespace
 {
     constexpr int ThreadCount = 256;
     constexpr int MaxBlockCount = 1024;
-
-    __global__ void checksumKernel(
-        const int* cudaPoints,
-        int pointLength,
-        const int* lastFP,
-        int lastFPLength,
-        int* checksum)
-    {
-        int index = blockIdx.x * blockDim.x + threadIdx.x;
-        int stride = blockDim.x * gridDim.x;
-        int totalLength = pointLength + lastFPLength;
-        int localChecksum = 0;
-
-        for (int i = index; i < totalLength; i += stride)
-        {
-            if (i < pointLength)
-            {
-                localChecksum += cudaPoints[i];
-            }
-            else
-            {
-                localChecksum += lastFP[i - pointLength];
-            }
-        }
-
-        atomicAdd(checksum, localChecksum);
-    }
+    constexpr unsigned long long Infinity = 0x7fffffffffffffffULL;
+    constexpr int TerminalLinkPointCode = 5;
 
     int errorCode(cudaError_t status)
     {
         return -1000 - static_cast<int>(status);
+    }
+
+    int blockCountForLength(int length)
+    {
+        int blockCount = (length + ThreadCount - 1) / ThreadCount;
+        if (blockCount < 1)
+        {
+            return 1;
+        }
+
+        if (blockCount > MaxBlockCount)
+        {
+            return MaxBlockCount;
+        }
+
+        return blockCount;
+    }
+
+    __global__ void initializeDistanceKernel(
+        const int* lastFP,
+        unsigned long long* distance,
+        int length)
+    {
+        int index = blockIdx.x * blockDim.x + threadIdx.x;
+        int stride = blockDim.x * gridDim.x;
+
+        for (int i = index; i < length; i += stride)
+        {
+            distance[i] = lastFP[i] == -1 ? Infinity : 0ULL;
+        }
+    }
+
+    __device__ void relaxEdge(
+        int sourceIndex,
+        int targetIndex,
+        int edgeCost,
+        int unitBase,
+        int pointCount,
+        unsigned long long* distance,
+        int* lastFP,
+        int* changed)
+    {
+        if (targetIndex < 0 || targetIndex >= pointCount || edgeCost < 0)
+        {
+            return;
+        }
+
+        int sourceOffset = unitBase + sourceIndex;
+        unsigned long long sourceDistance = distance[sourceOffset];
+        if (sourceDistance >= Infinity)
+        {
+            return;
+        }
+
+        unsigned long long proposedDistance = sourceDistance + static_cast<unsigned long long>(edgeCost);
+        if (proposedDistance < sourceDistance || proposedDistance > Infinity)
+        {
+            proposedDistance = Infinity;
+        }
+
+        int targetOffset = unitBase + targetIndex;
+        unsigned long long oldDistance = atomicMin(&distance[targetOffset], proposedDistance);
+        if (proposedDistance < oldDistance)
+        {
+            lastFP[targetOffset] = sourceIndex;
+            atomicExch(changed, 1);
+        }
+    }
+
+    __global__ void relaxPathKernel(
+        const int* cudaPoints,
+        int pointCount,
+        const int* connect,
+        int* lastFP,
+        unsigned long long* distance,
+        int unitCount,
+        int* changed)
+    {
+        int index = blockIdx.x * blockDim.x + threadIdx.x;
+        int stride = blockDim.x * gridDim.x;
+        int length = pointCount * unitCount;
+
+        for (int i = index; i < length; i += stride)
+        {
+            int unitIndex = i / pointCount;
+            int sourceIndex = i % pointCount;
+            int unitBase = unitIndex * pointCount;
+            int sourcePointOffset = sourceIndex * 3;
+            int sourceCircleIndex = cudaPoints[sourcePointOffset];
+            int sourcePointIndex = cudaPoints[sourcePointOffset + 1];
+            int sourcePointType = cudaPoints[sourcePointOffset + 2];
+
+            int nextIndex = sourceIndex + 1;
+            if (nextIndex < pointCount)
+            {
+                int nextPointOffset = nextIndex * 3;
+                int nextCircleIndex = cudaPoints[nextPointOffset];
+                if (nextCircleIndex == sourceCircleIndex)
+                {
+                    int nextPointIndex = cudaPoints[nextPointOffset + 1];
+                    int edgeCost = nextPointIndex - sourcePointIndex;
+                    if (edgeCost < 1)
+                    {
+                        edgeCost = 1;
+                    }
+
+                    relaxEdge(
+                        sourceIndex,
+                        nextIndex,
+                        edgeCost,
+                        unitBase,
+                        pointCount,
+                        distance,
+                        lastFP,
+                        changed);
+                }
+            }
+
+            int connectIndex = connect[sourceIndex];
+            if (connectIndex != -1)
+            {
+                int edgeCost = sourcePointType % TerminalLinkPointCode == 0 ? 1 : 0;
+                relaxEdge(
+                    sourceIndex,
+                    connectIndex,
+                    edgeCost,
+                    unitBase,
+                    pointCount,
+                    distance,
+                    lastFP,
+                    changed);
+            }
+        }
     }
 }
 
 extern "C" __declspec(dllexport) int Calpath_AcceptPoints(
     const int* cudaPoints,
     int length,
-    const int* lastFP,
-    int lastFPLength)
+    int* lastFP,
+    int lastFPLength,
+    const int* connect)
 {
     if (length < 0 || length % 3 != 0 || lastFPLength < 0)
     {
         return -1;
     }
 
-    int totalLength = length + lastFPLength;
+    int pointCount = length / 3;
+    int connectLength = pointCount;
 
-    if (totalLength == 0)
+    if (pointCount == 0)
+    {
+        return lastFPLength == 0 ? 0 : -5;
+    }
+
+    if (lastFPLength % pointCount != 0)
+    {
+        return -5;
+    }
+
+    int unitCount = lastFPLength / pointCount;
+    if (unitCount == 0)
     {
         return 0;
     }
 
-    if (length > 0 && cudaPoints == nullptr)
+    if (cudaPoints == nullptr)
     {
         return -2;
     }
 
-    if (lastFPLength > 0 && lastFP == nullptr)
+    if (lastFP == nullptr)
     {
         return -3;
     }
 
-    int* devicePoints = nullptr;
-    int* deviceLastFP = nullptr;
-    int* deviceChecksum = nullptr;
-    int hostChecksum = 0;
-    cudaError_t status = cudaSetDevice(0);
-
-    if (status != cudaSuccess)
+    if (connect == nullptr)
     {
-        fprintf(stderr, "cudaSetDevice failed: %s\n", cudaGetErrorString(status));
-        return errorCode(status);
+        return -4;
     }
 
-    if (length > 0)
+    Cal cal(cudaPoints, length, connect, connectLength, lastFP, lastFPLength);
+    if (cal.StatusCode() != 0)
     {
-        status = cudaMalloc(reinterpret_cast<void**>(&devicePoints), length * sizeof(int));
-        if (status != cudaSuccess)
+        if (cal.StatusMessage() != nullptr)
         {
-            fprintf(stderr, "cudaMalloc devicePoints failed: %s\n", cudaGetErrorString(status));
-            goto Error;
+            fprintf(stderr, "Cal init failed: %s\n", cal.StatusMessage());
         }
 
-        status = cudaMemcpy(devicePoints, cudaPoints, length * sizeof(int), cudaMemcpyHostToDevice);
-        if (status != cudaSuccess)
-        {
-            fprintf(stderr, "cudaMemcpy cudaPoints failed: %s\n", cudaGetErrorString(status));
-            goto Error;
-        }
+        return cal.StatusCode();
     }
 
-    if (lastFPLength > 0)
-    {
-        status = cudaMalloc(reinterpret_cast<void**>(&deviceLastFP), lastFPLength * sizeof(int));
-        if (status != cudaSuccess)
-        {
-            fprintf(stderr, "cudaMalloc deviceLastFP failed: %s\n", cudaGetErrorString(status));
-            goto Error;
-        }
+    cudaError_t status = cudaSuccess;
+    int hostChanged = 0;
+    int lastFPBlockCount = blockCountForLength(lastFPLength);
 
-        status = cudaMemcpy(deviceLastFP, lastFP, lastFPLength * sizeof(int), cudaMemcpyHostToDevice);
-        if (status != cudaSuccess)
-        {
-            fprintf(stderr, "cudaMemcpy lastFP failed: %s\n", cudaGetErrorString(status));
-            goto Error;
-        }
-    }
-
-    status = cudaMalloc(reinterpret_cast<void**>(&deviceChecksum), sizeof(int));
-    if (status != cudaSuccess)
-    {
-        fprintf(stderr, "cudaMalloc deviceChecksum failed: %s\n", cudaGetErrorString(status));
-        goto Error;
-    }
-
-    status = cudaMemset(deviceChecksum, 0, sizeof(int));
-    if (status != cudaSuccess)
-    {
-        fprintf(stderr, "cudaMemset deviceChecksum failed: %s\n", cudaGetErrorString(status));
-        goto Error;
-    }
-
-    {
-        int blockCount = (totalLength + ThreadCount - 1) / ThreadCount;
-        if (blockCount < 1)
-        {
-            blockCount = 1;
-        }
-        else if (blockCount > MaxBlockCount)
-        {
-            blockCount = MaxBlockCount;
-        }
-
-        checksumKernel<<<blockCount, ThreadCount>>>(
-            devicePoints,
-            length,
-            deviceLastFP,
-            lastFPLength,
-            deviceChecksum);
-    }
+    initializeDistanceKernel<<<lastFPBlockCount, ThreadCount>>>(
+        cal.DeviceLastFP(),
+        cal.DeviceDistance(),
+        cal.LastFPLength());
 
     status = cudaGetLastError();
     if (status != cudaSuccess)
     {
-        fprintf(stderr, "checksumKernel launch failed: %s\n", cudaGetErrorString(status));
-        goto Error;
+        fprintf(stderr, "initializeDistanceKernel launch failed: %s\n", cudaGetErrorString(status));
+        return errorCode(status);
     }
 
     status = cudaDeviceSynchronize();
     if (status != cudaSuccess)
     {
-        fprintf(stderr, "cudaDeviceSynchronize failed: %s\n", cudaGetErrorString(status));
-        goto Error;
+        fprintf(stderr, "initializeDistanceKernel synchronize failed: %s\n", cudaGetErrorString(status));
+        return errorCode(status);
     }
 
-    status = cudaMemcpy(&hostChecksum, deviceChecksum, sizeof(int), cudaMemcpyDeviceToHost);
-    if (status != cudaSuccess)
+    for (int iteration = 0; iteration < pointCount; iteration++)
     {
-        fprintf(stderr, "cudaMemcpy checksum failed: %s\n", cudaGetErrorString(status));
-        goto Error;
+        status = cudaMemset(cal.DeviceChanged(), 0, sizeof(int));
+        if (status != cudaSuccess)
+        {
+            fprintf(stderr, "cudaMemset changed failed: %s\n", cudaGetErrorString(status));
+            return errorCode(status);
+        }
+
+        relaxPathKernel<<<lastFPBlockCount, ThreadCount>>>(
+            cal.DeviceCudaPoints(),
+            cal.PointCount(),
+            cal.DeviceConnect(),
+            cal.DeviceLastFP(),
+            cal.DeviceDistance(),
+            cal.UnitCount(),
+            cal.DeviceChanged());
+
+        status = cudaGetLastError();
+        if (status != cudaSuccess)
+        {
+            fprintf(stderr, "relaxPathKernel launch failed: %s\n", cudaGetErrorString(status));
+            return errorCode(status);
+        }
+
+        status = cudaDeviceSynchronize();
+        if (status != cudaSuccess)
+        {
+            fprintf(stderr, "relaxPathKernel synchronize failed: %s\n", cudaGetErrorString(status));
+            return errorCode(status);
+        }
+
+        status = cudaMemcpy(&hostChanged, cal.DeviceChanged(), sizeof(int), cudaMemcpyDeviceToHost);
+        if (status != cudaSuccess)
+        {
+            fprintf(stderr, "cudaMemcpy changed failed: %s\n", cudaGetErrorString(status));
+            return errorCode(status);
+        }
+
+        if (hostChanged == 0)
+        {
+            break;
+        }
     }
 
-    cudaFree(devicePoints);
-    cudaFree(deviceLastFP);
-    cudaFree(deviceChecksum);
-    return hostChecksum;
-
-Error:
-    cudaFree(devicePoints);
-    cudaFree(deviceLastFP);
-    cudaFree(deviceChecksum);
-    return errorCode(status);
+    return cal.CopyLastFPToHost(lastFP, lastFPLength);
 }

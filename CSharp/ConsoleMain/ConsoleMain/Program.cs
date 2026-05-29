@@ -51,9 +51,9 @@ namespace ConsoleMain
             Console.WriteLine($"Purchase point count: {purchasePointCount}");
             Console.WriteLine("Press Enter to start CUDA calculation.");
 
-            // parallelStartPointCount 表示一次 CUDA 并行计算多少个起点。
+            // parallelStartPointCount means how many start points one CUDA batch calculates in parallel.
             int parallelStartPointCount = 3;
-            Console.WriteLine($"输入并行计算的数量,数量要小于 purchasePointCount+harvestPointCount");
+            Console.WriteLine("Input CUDA parallel start point count. It must be less than purchasePointCount + harvestPointCount.");
             if (int.TryParse(Console.ReadLine(), out parallelStartPointCount))
             { }
             else
@@ -90,29 +90,56 @@ namespace ConsoleMain
                 int calIndexStarted = 0;
                 while (calIndexStarted < tradingPoints.Count)
                 {
-                    parallelStartPointCount = Math.Min(parallelStartPointCount, tradingPoints.Count - calIndexStarted);
-                    List<int> lastFP = new List<int>(tradingPoints.Count * parallelStartPointCount);//这里用于存储最后一个地址。
-                                                                                                    //    List<int> LastRecordResultForSave = new List<int>(fpItems.Count * mCalCount);
+                    //parallelStartPointCount = Math.Min(parallelStartPointCount, tradingPoints.Count - calIndexStarted);
 
-                    for (int i = calIndexStarted; i < calIndexStarted + parallelStartPointCount; i++)
+                    int pointCount = cudaPoints.Length / 3;
+                    int batchStartPointCount = Math.Min(parallelStartPointCount, tradingPoints.Count - calIndexStarted);
+                    List<int> lastFP = new List<int>(pointCount * batchStartPointCount);
+                    for (int i = 0; i < pointCount * batchStartPointCount; i++)
                     {
-                        for (int j = 0; j < tradingPoints.Count; j++)
+                        lastFP.Add(-1);
+                    }
+
+                    for (int unitIndex = 0; unitIndex < batchStartPointCount; unitIndex++)
+                    {
+                        int tradingPointIndex = calIndexStarted + unitIndex;
+                        int startPointIndex = tradingPoints[tradingPointIndex];
+
+                        int pointType = cudaPoints[startPointIndex * 3 + 2];
+                        bool isTradingPoint =
+                            pointType % CircleGenerator.HarvestPointCode == 0 ||
+                            pointType % CircleGenerator.PurchasePointCode == 0;
+
+                        if (!isTradingPoint)
                         {
-                            var fpItem = tradingPoints[j];
-                            if (j == i)
+                            throw new InvalidOperationException(
+                                $"Point {startPointIndex} is not a trading point. PointType={pointType}.");
+                        }
+                        // Mark the start point as reached; self means path backtracking stops here.
+                        lastFP[unitIndex * pointCount + startPointIndex] = startPointIndex;
+                    }
+                    int[] lastFPResult = lastFP.ToArray();
+                    int status = CalpathCuda.AcceptPoints(cudaPoints, lastFPResult, connect);
+                    if (status != 0)
+                    {
+                        throw new InvalidOperationException($"CUDA path calculation failed: {status}.");
+                    }
+
+                    int reachedTradingPathCount = 0;
+                    for (int unitIndex = 0; unitIndex < batchStartPointCount; unitIndex++)
+                    {
+                        int unitBase = unitIndex * pointCount;
+                        foreach (int targetPointIndex in tradingPoints)
+                        {
+                            if (lastFPResult[unitBase + targetPointIndex] != -1)
                             {
-                                // var stringKey = $"{fpItem.fPCode}{fpItem.Height}";
-                                lastFP.Add(tradingPoints[j]);
-                            }
-                            else
-                            {
-                                lastFP.Add(-1);
+                                reachedTradingPathCount++;
                             }
                         }
                     }
-                    int checksum = CalpathCuda.AcceptPoints(cudaPoints, lastFP.ToArray());
-                    Console.WriteLine($"CUDA accept checksum: {checksum}");
-                    calIndexStarted += parallelStartPointCount;
+
+                    Console.WriteLine($"CUDA path status: {status}, reached trading paths: {reachedTradingPathCount}/{batchStartPointCount * tradingPoints.Count}");
+                    calIndexStarted += batchStartPointCount;
                 }
 
             }

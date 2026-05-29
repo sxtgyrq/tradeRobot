@@ -850,7 +850,24 @@ namespace TestProject1
         [Test]
         public void CalpathCuda_AcceptPoints_RejectsNonTripleLength()
         {
-            Assert.Throws<ArgumentException>(() => CalpathCuda.AcceptPoints(new[] { 1, 2 }));
+            Assert.Throws<ArgumentException>(() =>
+                CalpathCuda.AcceptPoints(new[] { 1, 2 }, Array.Empty<int>(), Array.Empty<int>()));
+        }
+
+        /// <summary>
+        /// Remark: the CUDA wrapper validates the connect/cudaPoints 1:3 ratio before invoking native code.
+        /// </summary>
+        [Test]
+        public void CalpathCuda_AcceptPoints_RejectsMismatchedConnectLength()
+        {
+            int[] cudaPoints =
+            {
+                0, 0, 6,
+                0, 18_600, 5,
+            };
+
+            Assert.Throws<ArgumentException>(() =>
+                CalpathCuda.AcceptPoints(cudaPoints, Array.Empty<int>(), new[] { -1 }));
         }
 
         /// <summary>
@@ -859,7 +876,12 @@ namespace TestProject1
         [Test]
         public void CalpathCuda_AcceptPoints_AllowsEmptyArrayWithoutNativeDll()
         {
-            Assert.That(CalpathCuda.AcceptPoints(Array.Empty<int>()), Is.EqualTo(0));
+            Assert.That(
+                CalpathCuda.AcceptPoints(
+                    Array.Empty<int>(),
+                    Array.Empty<int>(),
+                    Array.Empty<int>()),
+                Is.EqualTo(0));
         }
 
         /// <summary>

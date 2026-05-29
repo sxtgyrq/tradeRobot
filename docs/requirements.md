@@ -427,13 +427,112 @@ pointType % 11 == 0 表示采购点
 
 满足上述任一条件的点都应加入 `tradingPoints`。因此，`tradingPoints` 中保存的是排序后的点序号 `i`，对应的点数据位于 `cudaPoints[i * 3]` 开始的三个 `int`。
 
-`parallelStartPointCount` 表示一次 CUDA 并行计算多少个起点。构建 `lastFP` 时，应按当前批次的起点数量和交易点数量初始化：
+`parallelStartPointCount` 表示一次 CUDA 并行计算多少个起点。最后一批交易点数量可能不足 `parallelStartPointCount`，因此实际批次数量记为：
 
 ```text
-lastFP.Length = tradingPoints.Count * parallelStartPointCount
+batchStartPointCount = min(parallelStartPointCount, tradingPoints.Count - calIndexStarted)
 ```
 
-`lastFP` 默认值为 `-1`。对于当前批次中的每一个起点，应在对应位置写入该起点的 CUDA 点序号，用于表示该起点当前路径的最后一个地址。`lastFP` 中保存的值同样是排序后的 CUDA 点序号，而不是圆内 `pointIndex`，也不是 `cudaPoints` 的字节偏移或三元组偏移。
+构建 `lastFP` 时，必须按“全部 CUDA 点数量 × 当前批次起点数量”初始化，而不是按交易点数量初始化：
+
+```text
+pointCount = cudaPoints.Length / 3
+lastFP.Length = pointCount * batchStartPointCount
+```
+
+`lastFP` 是 CUDA 路径计算的前驱表，同时也是 CUDA 的回写结果数组。它的下标含义如下：
+
+```text
+lastFP[unitIndex * pointCount + pointIndex] = previousPointIndex
+```
+
+其中：
+
+- `unitIndex` 表示当前批次中的第几个并行起点，取值范围为 `0 <= unitIndex < batchStartPointCount`。
+- `pointIndex` 表示排序后的 CUDA 点序号，不是圆内路径点编号。
+- `previousPointIndex` 表示到达 `pointIndex` 时的上一个 CUDA 点序号。
+- `previousPointIndex = -1` 表示该点尚未从当前起点到达。
+
+`lastFP` 默认值为 `-1`。对于当前批次中的每一个交易起点，必须先确认该点满足交易点判定规则，即 `pointType % 2 == 0` 或 `pointType % 11 == 0`。确认后，将该起点标记为已到达：
+
+```text
+startPointIndex = tradingPoints[calIndexStarted + unitIndex]
+lastFP[unitIndex * pointCount + startPointIndex] = startPointIndex
+```
+
+起点的前驱记录为自身，表示路径回溯到该点时结束。`lastFP` 中保存的所有值都必须是排序后的 CUDA 点序号，不能使用圆内 `pointIndex`，也不能使用 `cudaPoints` 的字节偏移或三元组偏移。
+
+#### 2.8.3 CUDA 路径计算规则
+
+CUDA 路径计算的目标是：以每一个交易点作为起点，计算其到其他交易点的可达路径。交易点包括全场唯一收割点和所有采购点。CUDA 内部可以同时计算多个起点，单批并行起点数量由 `batchStartPointCount` 决定。
+
+CUDA 计算函数输入为：
+
+```text
+cudaPoints: int[]，格式为 [circleIndex, pointIndex, pointType, ...]
+connect: int[]，长度为 pointCount
+lastFP: int[]，长度为 pointCount * batchStartPointCount
+```
+
+CUDA 计算函数输出为：
+
+```text
+status: int
+lastFP: int[]，原数组被回写为路径前驱表结果
+```
+
+返回规则：
+
+- `status = 0` 表示计算成功。
+- `status != 0` 表示计算失败，调用方应直接报错，不得继续使用本批结果。
+- `lastFP` 作为输入时用于标记每个并行起点；作为输出时用于保存从每个起点出发到所有 CUDA 点的前驱关系。
+
+CUDA 内部需要维护 `distance` 数组用于累计路径长度。`distance` 不对外暴露；由于单个路径点序号可以接近 `int.MaxValue`，多段路径累计距离可能超过 `int` 范围，因此 `distance` 应使用 64 位无符号整数类型。`cudaPoints`、`connect` 和 `lastFP` 仍然使用 `int`。
+
+`distance` 初始化规则如下：
+
+- 如果 `lastFP[unitIndex * pointCount + pointIndex] == -1`，则该点初始不可达，`distance` 设为无穷大。
+- 如果 `lastFP[unitIndex * pointCount + pointIndex] != -1`，则该点初始已到达，`distance` 设为 `0`。
+
+CUDA 以排序后的合成派生点作为图节点，不要求枚举或保存圆上的所有路径点。圆内行走边按同一圆内相邻的 CUDA 点序号隐式生成：
+
+- 对于排序后第 `i` 个 CUDA 点，如果第 `i + 1` 个 CUDA 点存在且二者 `circleIndex` 相同，则允许从 `i` 走到 `i + 1`。
+- 该圆内边的路径长度为 `cudaPoints[(i + 1) * 3 + 1] - cudaPoints[i * 3 + 1]`；如果计算结果小于 `1`，按 `1` 处理。
+- 因为同一圆内 CUDA 点按 `pointIndex` 升序排列，所以该规则等价于沿该圆允许方向前进到下一个特殊路径点。
+- 当到达末尾联通点时，不通过 `i + 1` 回到第一路径点，而是通过 `connect` 中的末尾联通关系跳转到同圆 `pointIndex = 0` 的第一路径点。
+
+`connect` 跳转边按以下规则参与 CUDA 路径计算：
+
+- 如果 `connect[i] = -1`，则第 `i` 个 CUDA 点没有特殊跳转边。
+- 如果 `connect[i] = j`，则允许从第 `i` 个 CUDA 点跳转到第 `j` 个 CUDA 点。
+- 当第 `i` 个 CUDA 点是末尾联通点，即 `pointType % 5 == 0` 时，该跳转边长度按 `1` 计算。
+- 当第 `i` 个 CUDA 点不是末尾联通点时，该跳转边表示普通联通点之间的圆间跳转，长度按 `0` 计算。
+
+CUDA 计算采用迭代松弛方式更新 `distance` 与 `lastFP`：
+
+```text
+如果 source 已到达，且通过 source 到 target 的累计距离更短：
+    distance[target] = 新的更短距离
+    lastFP[target] = source
+```
+
+该过程按批次内每个起点独立进行。每一批最多迭代 `pointCount` 轮；如果某一轮没有任何点发生更新，则本批计算提前结束。
+
+对于任意起点 `startPointIndex` 和目标交易点 `targetPointIndex`：
+
+- 如果 `lastFP[unitIndex * pointCount + targetPointIndex] == -1`，表示该目标交易点不可达，应视为路径计算失败或业务不可用状态。
+- 如果 `lastFP[unitIndex * pointCount + targetPointIndex] != -1`，表示该目标交易点可达，可以通过前驱表反向回溯路径。
+- 如果 `targetPointIndex == startPointIndex`，则 `lastFP` 中记录为自身，仅用于标记起点和回溯终止；统计“到其他交易点”的业务结果时可以跳过该自路径。
+
+路径回溯规则如下：
+
+```text
+current = targetPointIndex
+previous = lastFP[unitIndex * pointCount + current]
+重复令 current = previous，直到 previous == current 到达起点
+```
+
+回溯得到的是从目标点反向到起点的 CUDA 点序列；业务如需正向路径，应将该序列反转。
 
 ### 2.9 路径行走规则
 
@@ -708,7 +807,7 @@ distance(O, P) = sqrt(x^2 + y^2)
 - 调用 CUDA 计算函数前，必须构建 `connect` 数组；`connect.Length = cudaPoints.Length / 3`，默认值为 `-1`，末尾联通点单向指向同圆第一路径点，普通联通点按普通联通关系双向互指，其他点保持 `-1`。
 - 构建 `connect` 时，如果存在重复 `(circleIndex, pointIndex)`、缺失跳转目标或同一 CUDA 点被分配到不同跳转目标，系统应直接报错，不得继续调用 CUDA。
 - 调用 CUDA 计算函数前，应从排序后的 CUDA 点序号中提取交易点 `tradingPoints`；`pointType % 2 == 0` 或 `pointType % 11 == 0` 的点均属于交易点。
-- 调用 CUDA 计算函数前，应按 `parallelStartPointCount` 和 `tradingPoints.Count` 构建 `lastFP`；`lastFP` 默认值为 `-1`，其中写入的地址必须是排序后的 CUDA 点序号。
+- 调用 CUDA 计算函数前，应按 `pointCount * batchStartPointCount` 构建 `lastFP`，其中 `pointCount = cudaPoints.Length / 3`；`lastFP` 默认值为 `-1`，每个并行起点应写入 `lastFP[unitIndex * pointCount + startPointIndex] = startPointIndex`，且所有值必须是排序后的 CUDA 点序号。
 - 做多圆上的路径点只能按照逆时针方向行走，做空圆上的路径点只能按照顺时针方向行走。
 - 生成结果中不存在孤立圆。
 - 任意一个圆都能找到至少一个与其相交或相切的其他圆。
@@ -729,7 +828,7 @@ distance(O, P) = sqrt(x^2 + y^2)
 - 应在所有路径点中，找到距离原点 `(0, 0)` 最近且不是末尾联通点的路径点，并将其标记为全局唯一的收割点。
 - 在整体连通、圆内有向闭环、普通联通关系双向的前提下，从收割点应能够到达任意路径点。
 - 每个采购点都必须能够通过路径点、末尾联通点和普通联通点，最终到达收割点。
-- 对于每个采购点，应分别计算收割点到采购点的距离，以及采购点到收割点的距离。
+- CUDA 路径计算应以所有交易点为起点分批执行，并通过回写后的 `lastFP` 前驱表确认任意交易点到其他交易点的可达路径；对于每个采购点，应分别计算收割点到采购点的距离，以及采购点到收割点的距离。
 - 对于每个采购点，应生成 `收割点 -> 采购点 -> 收割点` 的完整路径。
 - 当完整路径经过做多圆时，应能够根据路径在该做多圆上的累计弧度 `θ` 计算做多保证金、做多名义仓位和止盈价。
 - 当完整路径经过做空圆时，应能够根据路径在该做空圆上的累计弧度 `θ` 计算做空保证金、做空名义仓位和止盈价。
